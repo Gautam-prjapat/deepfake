@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import tempfile
+import kagglehub  # NEW: Import kagglehub for downloading the dataset
 from model_utils import load_model, predict_video
 
 # ==========================================
@@ -17,11 +18,26 @@ st.set_page_config(
 # ==========================================
 @st.cache_resource
 def get_model_and_device():
-    weights_path = "istvt_master_weights.pth"
-    if not os.path.exists(weights_path):
-        st.error(f"Critical Error: Missing weights file at {weights_path}. Please place it in the same folder as this app.")
-        st.stop()
-    return load_model(weights_path)
+    # Adding a spinner so the user knows a large file is downloading
+    with st.spinner("Downloading/Loading ISTVT model weights. This may take a minute on the first run..."):
+        try:
+            # This downloads the dataset to a local cache and returns the folder path
+            # It only downloads the file if it hasn't been downloaded already
+            dataset_path = kagglehub.dataset_download("gam888i/istvt-pth")
+            
+            # Construct the full path to the .pth file inside the downloaded folder
+            # Note: Ensure the filename here exactly matches the file in your Kaggle dataset!
+            weights_path = os.path.join(dataset_path, "istvt_master_weights.pth")
+            
+            if not os.path.exists(weights_path):
+                st.error(f"Critical Error: Downloaded the dataset but could not find the weights file at {weights_path}.")
+                st.stop()
+                
+            return load_model(weights_path)
+            
+        except Exception as e:
+            st.error(f"Failed to download or load the model from Kaggle: {e}")
+            st.stop()
 
 model, device = get_model_and_device()
 
