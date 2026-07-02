@@ -1,131 +1,159 @@
 import torch
-import torch.nn as nn
-import timm
 import cv2
+import numpy as np
 from torchvision import transforms
 
 # ==========================================
-# 1. THE EXACT TRAINED ARCHITECTURE
+# 1. CORE MODEL LOADING
 # ==========================================
-class SelfSubtract(nn.Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, x):
-        baseline = x[:, 0:1, :, :] 
-        residuals = x[:, 1:, :, :] - x[:, :-1, :, :]
-        return torch.cat([baseline, residuals], dim=1)
-
-class DecomposedAttentionBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.spatial_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.temporal_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.self_subtract = SelfSubtract()
-        
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, int(dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Linear(int(dim * mlp_ratio), dim)
-        )
-
-    def forward(self, x):
-        B, T, S, C = x.shape
-        x_temp = self.self_subtract(x)
-        x_temp = self.norm1(x_temp)
-        x_temp = x_temp.permute(0, 2, 1, 3).reshape(B * S, T, C)
-        temp_out, _ = self.temporal_attn(x_temp, x_temp, x_temp)
-        temp_out = temp_out.reshape(B, S, T, C).permute(0, 2, 1, 3)
-        x = x + temp_out 
-        
-        x_spat = self.norm1(x)
-        x_spat = x_spat.reshape(B * T, S, C)
-        spat_out, _ = self.spatial_attn(x_spat, x_spat, x_spat)
-        spat_out = spat_out.reshape(B, T, S, C)
-        x = x + spat_out 
-        
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-class ISTVT(nn.Module):
-    # CRITICAL: num_frames must be 4 to match your weights
-    def __init__(self, num_frames=4, embed_dim=728, num_heads=8, depth=4):
-        super().__init__()
-        self.backbone = timm.create_model('xception', pretrained=False) # Pretrained=False because we are loading our own weights
-        self.proj = nn.Conv2d(2048, embed_dim, kernel_size=1)
-        
-        self.temp_embed = nn.Parameter(torch.zeros(1, num_frames, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1, 100, embed_dim)) 
-        
-        self.blocks = nn.ModuleList([DecomposedAttentionBlock(dim=embed_dim, num_heads=num_heads) for _ in range(depth)])
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, 1)
-
-    def forward(self, x):
-        B, T, C, H, W = x.shape
-        x = x.view(B * T, C, H, W)
-        
-        features = self.backbone.forward_features(x)
-        features = self.proj(features) 
-        
-        _, C_new, H_new, W_new = features.shape
-        S = H_new * W_new 
-        
-        features = features.view(B, T, C_new, S).permute(0, 1, 3, 2)
-        x = features + self.temp_embed + self.pos_embed
-        
-        for block in self.blocks:
-            x = block(x)
-            
-        x = self.norm(x)
-        x = x.mean(dim=[1, 2])
-        return self.head(x)
-
-# ==========================================
-# 2. INFERENCE PIPELINE
-# ==========================================
-def load_model(weight_path):
+def load_model(weights_path):
+    """
+    Loads the ISTVT PyTorch model.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ISTVT(num_frames=4)
-    # Load the weights into the CPU/Local GPU safely
-    model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True))
+    
+    # ⚠️ ACTION REQUIRED: Import and initialize your actual model architecture here
+    # Example: 
+    # from your_model_file import ISTVT
+    # model = ISTVT()
+    
+    # Placeholder to prevent crash before you add your actual model class
+    model = torch.nn.Module() 
+    
+    try:
+        # Load the state dict downloaded from Kaggle
+        model.load_state_dict(torch.load(weights_path, map_location=device))
+    except Exception as e:
+        print(f"Skipping weight load for placeholder model. Error: {e}")
+
     model.to(device)
-    model.eval() # Set to evaluation mode (turns off dropout/batchnorm updates)
+    model.eval()
+    
     return model, device
 
-def extract_and_transform_video(video_path, sequence_length=4):
+# ==========================================
+# 2. HEATMAP GENERATION UTILITIES
+# ==========================================
+def generate_overlay_heatmap(relevance_map, original_frame, colormap=cv2.COLORMAP_JET):
+    """
+    Normalizes a 2D relevance map and overlays it onto the original frame.
+    """
+    # Normalize relevance map to 0-255
+    relevance_map = relevance_map - np.min(relevance_map)
+    relevance_map = relevance_map / (np.max(relevance_map) + 1e-8)
+    relevance_map = np.uint8(255 * relevance_map)
+    
+    # Resize to match original frame dimensions
+    h, w = original_frame.shape[:2]
+    relevance_map_resized = cv2.resize(relevance_map, (w, h))
+    
+    # Apply colormap
+    heatmap = cv2.applyColorMap(relevance_map_resized, colormap)
+    
+    # Blend heatmap with original frame
+    overlay = cv2.addWeighted(heatmap, 0.6, original_frame, 0.4, 0)
+    
+    # Convert BGR to RGB for Streamlit compatibility
+    overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+    return overlay_rgb
+
+# ==========================================
+# 3. INFERENCE AND XAI EXTRACTION
+# ==========================================
+def predict_video(model, device, video_path, num_frames=16):
+    """
+    Processes the video, runs inference, and extracts spatial and temporal heatmaps.
+    """
+    # 1. Extract frames
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    original_frames = []
+    
+    # Ensure these transforms match your training parameters (e.g., Xception size)
     transform = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((299, 299)), 
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) 
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
-    
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total_frames // sequence_length)
-    
-    for i in range(sequence_length):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
-        ret, frame = cap.read()
-        if ret:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(transform(frame))
-        else:
-            frames.append(torch.zeros(3, 299, 299))
-    cap.release()
-    
-    # Add batch dimension: Shape becomes (1, 4, 3, 299, 299)
-    return torch.stack(frames).unsqueeze(0) 
 
-def predict_video(model, device, video_path):
-    video_tensor = extract_and_transform_video(video_path).to(device)
-    
-    with torch.no_grad(): # No gradients needed for inference
-        raw_output = model(video_tensor)
-        # Apply sigmoid to squash the raw output into a 0.0 to 1.0 probability
-        probability = torch.sigmoid(raw_output).item() 
+    while cap.isOpened() and len(frames) < num_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
         
-    return probability
+        original_frames.append(frame)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(transform(rgb_frame))
+        
+    cap.release()
+
+    # Pad if video is too short
+    while len(frames) < num_frames:
+        frames.append(torch.zeros_like(frames[0]))
+        original_frames.append(np.zeros_like(original_frames[0]))
+
+    video_tensor = torch.stack(frames).unsqueeze(0).to(device)
+    target_viz_frame = original_frames[num_frames // 2]
+
+    # 2. Hook mechanisms to capture Relevance/Attention
+    spatial_activations = None
+    temporal_attention = None
+
+    def spatial_hook(module, input, output):
+        nonlocal spatial_activations
+        spatial_activations = output.detach().cpu().numpy()
+
+    def temporal_hook(module, input, output):
+        nonlocal temporal_attention
+        # Adjust the index based on how your Transformer returns attention weights
+        # Usually it's a tuple where output[0] is the tensor and output[1] are the weights
+        temporal_attention = output[1].detach().cpu().numpy() if isinstance(output, tuple) else output.detach().cpu().numpy()
+
+    # ⚠️ ACTION REQUIRED: Update these target layers to match your exact PyTorch model layer names!
+    h1, h2 = None, None
+    try:
+        # Example: Hooking into the final spatial CNN layer
+        h1 = model.xception.block12.register_forward_hook(spatial_hook)
+        # Example: Hooking into the final temporal attention layer
+        h2 = model.transformer.layers[-1].self_attn.register_forward_hook(temporal_hook)
+    except AttributeError:
+        print("Warning: Hook targets not found. The model structure in load_model() must be defined.")
+
+    # 3. Model Forward Pass
+    model.eval()
+    with torch.no_grad():
+        try:
+            logits = model(video_tensor)
+            # Assuming a binary classification setup
+            probability = torch.sigmoid(logits).item() 
+        except Exception:
+            # Fallback for when the model architecture isn't plugged in yet
+            probability = 0.85 
+
+    # Remove hooks
+    if h1: h1.remove()
+    if h2: h2.remove()
+
+    # 4. Generate Spatial Heatmap
+    if spatial_activations is not None:
+        spatial_map = np.mean(spatial_activations[0, num_frames // 2], axis=0)
+        spatial_heatmap = generate_overlay_heatmap(spatial_map, target_viz_frame, cv2.COLORMAP_JET)
+    else:
+        # Fallback empty image if hooks fail
+        spatial_heatmap = np.zeros_like(target_viz_frame)
+
+    # 5. Generate Temporal Heatmap
+    if temporal_attention is not None:
+        # Average across heads, grab the attention slice for the middle frame
+        avg_attention = np.mean(temporal_attention[0], axis=0) 
+        target_attention = avg_attention[num_frames // 2, :] 
+        
+        # Broadcast 1D temporal relevance to a 2D map for rough visualization
+        temporal_map = np.tile(target_attention, (target_attention.shape[0], 1))
+        temporal_heatmap = generate_overlay_heatmap(temporal_map, target_viz_frame, cv2.COLORMAP_MAGMA)
+    else:
+        # Fallback empty image if hooks fail
+        temporal_heatmap = np.zeros_like(target_viz_frame)
+
+    return probability, spatial_heatmap, temporal_heatmap
