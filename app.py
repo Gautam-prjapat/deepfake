@@ -14,23 +14,22 @@ st.set_page_config(
 )
 
 # ==========================================
-# CACHE THE MODEL
+# CACHE THE MODEL (Prevents reloading on every click)
 # ==========================================
 @st.cache_resource
 def get_model_and_device():
-    with st.spinner("Downloading/Loading ISTVT model weights. This may take a minute on the first run..."):
+    with st.spinner("Downloading/Loading ISTVT model weights from Kaggle. Please wait..."):
         try:
             dataset_path = kagglehub.dataset_download("gam888i/istvt-pth")
             weights_path = os.path.join(dataset_path, "istvt_master_weights.pth")
             
             if not os.path.exists(weights_path):
-                st.error(f"Critical Error: Downloaded the dataset but could not find the weights file at {weights_path}.")
+                st.error(f"Critical Error: Weights file not found at {weights_path}.")
                 st.stop()
                 
             return load_model(weights_path)
-            
         except Exception as e:
-            st.error(f"Failed to download or load the model from Kaggle: {e}")
+            st.error(f"Failed to load the model: {e}")
             st.stop()
 
 model, device = get_model_and_device()
@@ -45,31 +44,29 @@ st.divider()
 uploaded_file = st.file_uploader("Upload a video for deepfake analysis", type=["mp4", "avi", "mov"])
 
 if uploaded_file is not None:
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    tfile.write(uploaded_file.read())
+    video_path = tfile.name
+
     col1, col2 = st.columns([1, 1])
     
     with col1:
         st.subheader("Source Video")
-        st.video(uploaded_file)
+        st.video(video_path)
 
     with col2:
         st.subheader("Analysis & Verdict")
         analyze_button = st.button("Run ISTVT Analysis", type="primary", use_container_width=True)
         
         if analyze_button:
-            with st.spinner("Extracting frames and running Spatial-Temporal attention mechanisms..."):
-                video_path = None
+            with st.spinner("Extracting frames and running attention mechanisms..."):
                 try:
-                    # Create and safely close temp file so OpenCV can read it cleanly
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tfile:
-                        tfile.write(uploaded_file.read())
-                        video_path = tfile.name
-                    
-                    # Run the inference and extract XAI heatmaps
-                    probability, spatial_heatmap, temporal_heatmap = predict_video(model, device, video_path)
+                    # CRITICAL FIX: Unpack both variables returned by the function
+                    probability, spatial_heatmap = predict_video(model, device, video_path)
                     
                     st.divider()
                     
-                    # 1. The Verdict Logic
+                    # The Verdict Logic
                     if probability > 0.5:
                         confidence = probability * 100
                         st.error("🚨 **VERDICT: DEEPFAKE DETECTED**")
@@ -81,25 +78,14 @@ if uploaded_file is not None:
                         st.progress(1.0 - probability)
                         st.markdown(f"**Confidence Score:** {confidence:.2f}% probability of authenticity.")
                     
-                    st.divider()
-
-                    # 2. XAI / LRP Visualizations (Matches Resume Claims)
-                    st.subheader("🔍 Interpretable AI (LRP Analysis)")
-                    st.caption("Visualizing specific manipulation artifacts captured by the spatial and temporal attention heads.")
-                    
-                    col_spat, col_temp = st.columns(2)
-                    with col_spat:
-                        st.image(spatial_heatmap, caption="Spatial Attention (Blending/Forgery Artifacts)", use_container_width=True)
-                    with col_temp:
-                        st.image(temporal_heatmap, caption="Temporal Attention (Inter-frame Inconsistencies)", use_container_width=True)
+                    # Display XAI Spatial Heatmap explanation below metrics
+                    st.subheader("Spatial Attention Map (Interpretable Hook)")
+                    st.image(spatial_heatmap, caption="Highlighted regions show where the Transformer detected synthetic textures/artifacts.", use_container_width=True)
                         
                 except Exception as e:
                     st.error(f"An error occurred during processing: {e}")
-                
-                finally:
-                    # Clean up file immediately after processing is done
-                    if video_path and os.path.exists(video_path):
-                        try:
-                            os.remove(video_path)
-                        except Exception:
-                            pass
+            
+    try:
+        os.remove(video_path)
+    except:
+        pass
