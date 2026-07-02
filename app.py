@@ -54,14 +54,14 @@ if uploaded_file is not None:
         st.subheader("Source Video")
         st.video(video_path)
         
-        st.info("🧠 **Auto-Scaling Enabled:** The ISTVT engine will automatically scan all available frames up to a maximum security limit of 520 frames to prevent hardware exhaustion.")
+        st.info("🧠 **Auto-Scaling Enabled:** The ISTVT streaming engine will automatically scan all available frames up to a maximum security limit of 520 frames, preventing server memory crashes.")
 
     with col2:
         st.subheader("Analysis & Verdict")
         analyze_button = st.button("Run Autonomous ISTVT Analysis", type="primary", use_container_width=True)
         
         if analyze_button:
-            with st.spinner("Running autonomous parallel sliding-window inference..."):
+            with st.spinner("Running autonomous parallel streaming inference..."):
                 try:
                     # Execute auto-scaled array inference pipeline
                     probability, spatial_heatmap = predict_video(model, device, video_path)
