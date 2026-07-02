@@ -86,7 +86,6 @@ class ISTVT(nn.Module):
 # 2. XAI / HEATMAP UTILS
 # ==========================================
 def generate_overlay_heatmap(relevance_map, original_frame, colormap=cv2.COLORMAP_JET):
-    """Normalizes a 2D map and overlays it onto the original frame."""
     relevance_map = relevance_map - np.min(relevance_map)
     relevance_map = relevance_map / (np.max(relevance_map) + 1e-8)
     relevance_map = np.uint8(255 * relevance_map)
@@ -99,7 +98,7 @@ def generate_overlay_heatmap(relevance_map, original_frame, colormap=cv2.COLORMA
     return overlay
 
 # ==========================================
-# 3. INFERENCE PIPELINE
+# 3. SLIDING WINDOW INFERENCE PIPELINE
 # ==========================================
 def load_model(weight_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -109,7 +108,11 @@ def load_model(weight_path):
     model.eval() 
     return model, device
 
-def predict_video(model, device, video_path, sequence_length=4):
+def predict_video(model, device, video_path, total_frames_to_sample=16):
+    """
+    Samples an arbitrary number of frames across the video timeline,
+    processes them in architecture-compliant chunks of 4, and aggregates the results.
+    """
     transform = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((299, 299)), 
@@ -118,63 +121,69 @@ def predict_video(model, device, video_path, sequence_length=4):
     ])
     
     cap = cv2.VideoCapture(video_path)
-    frames = []
-    original_viz_frames = []
+    all_frames = []
+    all_viz_frames = []
     
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total_frames // sequence_length)
+    total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(1, total_video_frames // total_frames_to_sample)
     
-    for i in range(sequence_length):
+    for i in range(total_frames_to_sample):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
         ret, frame = cap.read()
         if ret:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(transform(frame_rgb))
-            original_viz_frames.append(cv2.resize(frame_rgb, (299, 299)))
+            all_frames.append(transform(frame_rgb))
+            all_viz_frames.append(cv2.resize(frame_rgb, (299, 299)))
         else:
-            frames.append(torch.zeros(3, 299, 299))
-            original_viz_frames.append(np.zeros((299, 299, 3), dtype=np.uint8))
+            all_frames.append(torch.zeros(3, 299, 299))
+            all_viz_frames.append(np.zeros((299, 299, 3), dtype=np.uint8))
             
     cap.release()
-    
-    video_tensor = torch.stack(frames).unsqueeze(0).to(device)
-    target_idx = sequence_length // 2  # Middle frame (index 2)
-    target_viz_frame = original_viz_frames[target_idx]
 
-    # --- SETUP HOOKS ---
-    spatial_activations = None
-    temporal_attention = None
+    # Variables to track peak fake metrics across chunks
+    max_probability = 0.0
+    best_spatial_heatmap = None
 
-    def spatial_hook(module, input, output):
-        nonlocal spatial_activations
-        spatial_activations = output.detach().cpu().numpy()
+    # Process files in windows of exactly 4 frames to fit the architecture position tokens
+    for chunk_idx in range(0, total_frames_to_sample, 4):
+        chunk_frames = all_frames[chunk_idx:chunk_idx+4]
+        chunk_viz = all_viz_frames[chunk_idx:chunk_idx+4]
+        
+        # Pad with blank frames if the video cuts off and falls short of a multiple of 4
+        while len(chunk_frames) < 4:
+            chunk_frames.append(torch.zeros(3, 299, 299))
+            chunk_viz.append(np.zeros((299, 299, 3), dtype=np.uint8))
 
-    def temporal_hook(module, input, output):
-        nonlocal temporal_attention
-        # Safety check: Handle cases where weights are None due to fast-path SDPA execution
-        if isinstance(output, tuple) and output[1] is not None:
-            temporal_attention = output[1].detach().cpu().numpy()
+        video_tensor = torch.stack(chunk_frames).unsqueeze(0).to(device)
+        target_idx = 2  # Focus evaluation on the middle frame of the chunk
+        target_viz_frame = chunk_viz[target_idx]
+
+        # --- SETUP HOOKS FOR THIS CHUNK ---
+        spatial_activations = None
+
+        def spatial_hook(module, input, output):
+            nonlocal spatial_activations
+            spatial_activations = output.detach().cpu().numpy()
+
+        h1 = model.proj.register_forward_hook(spatial_hook)
+
+        # --- FORWARD PASS ---
+        with torch.no_grad():
+            raw_output = model(video_tensor)
+            chunk_probability = torch.sigmoid(raw_output).item() 
+
+        h1.remove()
+
+        # --- GENERATE & UPDATE MAX ATTENTION HEATMAP ---
+        if spatial_activations is not None:
+            spatial_map = np.mean(spatial_activations[target_idx], axis=0)
+            chunk_heatmap = generate_overlay_heatmap(spatial_map, target_viz_frame)
         else:
-            temporal_attention = None
+            chunk_heatmap = target_viz_frame
 
-    h1 = model.proj.register_forward_hook(spatial_hook)
-    h2 = model.blocks[-1].temporal_attn.register_forward_hook(temporal_hook)
+        # Track the absolute highest score (if a single frame looks fake, flag the video)
+        if chunk_probability >= max_probability or best_spatial_heatmap is None:
+            max_probability = chunk_probability
+            best_spatial_heatmap = chunk_heatmap
 
-    # --- FORWARD PASS ---
-    with torch.no_grad():
-        raw_output = model(video_tensor)
-        probability = torch.sigmoid(raw_output).item() 
-
-    # Clean up hooks
-    h1.remove()
-    h2.remove()
-
-    # --- GENERATE HEATMAPS ---
-    if spatial_activations is not None:
-        spatial_map = np.mean(spatial_activations[target_idx], axis=0)
-        spatial_heatmap = generate_overlay_heatmap(spatial_map, target_viz_frame, cv2.COLORMAP_JET)
-    else:
-        spatial_heatmap = target_viz_frame
-
-    # CRITICAL FIX: Return values explicitly back to app.py
-    return probability, spatial_heatmap
+    return max_probability, best_spatial_heatmap
