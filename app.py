@@ -54,25 +54,17 @@ if uploaded_file is not None:
         st.subheader("Source Video")
         st.video(video_path)
         
-        # INCREASED SCANNED FRAME CAPACITY CONFIGURATION
-        frames_to_scan = st.slider(
-            "Scan Coverage Depth (Total Frames Explored)", 
-            min_value=4, 
-            max_value=256,  # Scaled from 32 to 256 frames
-            value=64,       # Default starting sample coverage set to 64 frames
-            step=4,         # Must remain a multiple of 4 to fit the window blocks
-            help="Higher numbers slice the video into deeper checks to catch rapid face swaps."
-        )
+        st.info("🧠 **Auto-Scaling Enabled:** The ISTVT engine will automatically scan all available frames up to a maximum security limit of 520 frames to prevent hardware exhaustion.")
 
     with col2:
         st.subheader("Analysis & Verdict")
-        analyze_button = st.button("Run Multi-Window ISTVT Analysis", type="primary", use_container_width=True)
+        analyze_button = st.button("Run Autonomous ISTVT Analysis", type="primary", use_container_width=True)
         
         if analyze_button:
-            with st.spinner(f"Running parallel sliding-window inference across {frames_to_scan} frames..."):
+            with st.spinner("Running autonomous parallel sliding-window inference..."):
                 try:
-                    # Execute sliding window array inference pipeline
-                    probability, spatial_heatmap = predict_video(model, device, video_path, total_frames_to_sample=frames_to_scan)
+                    # Execute auto-scaled array inference pipeline
+                    probability, spatial_heatmap = predict_video(model, device, video_path)
                     
                     st.divider()
                     
@@ -92,11 +84,11 @@ if uploaded_file is not None:
                     
                     # Render Attention Activation Layout Map
                     st.subheader("Peak Attention Anomalies Layer Visualization")
-                    st.image(
-                        spatial_heatmap, 
-                        caption="Activation landscape highlighting structural areas evaluated during peak suspicion frames.", 
-                        use_container_width=True
-                    )
+                    
+                    if probability > 0.5:
+                        st.image(spatial_heatmap, caption="Activation landscape highlighting structural areas evaluated during peak suspicion frames.", use_container_width=True)
+                    else:
+                        st.image(spatial_heatmap, caption="No synthetic artifacts detected. The frame is authentic.", use_container_width=True)
                         
                 except Exception as e:
                     st.error(f"An error occurred during processing: {e}")
