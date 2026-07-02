@@ -63,19 +63,19 @@ if uploaded_file is not None:
         if analyze_button:
             with st.spinner("Running autonomous parallel streaming inference..."):
                 try:
-                    # Execute auto-scaled array inference pipeline
+                    # Execute global-accumulated streaming pipeline
                     probability, spatial_heatmap = predict_video(model, device, video_path)
                     
                     st.divider()
                     
                     # Core Performance Metrics Display
-                    st.metric(label="Peak Manipulation Probability Detect Score", value=f"{probability:.4f}")
+                    st.metric(label="Global Video Manipulation Score", value=f"{probability:.4f}")
                     
                     if probability > 0.5:
                         confidence = probability * 100
                         st.error(f"🚨 **VERDICT: DEEPFAKE DETECTED ({confidence:.2f}% Confidence)**")
                         st.progress(probability)
-                        st.caption("Spatial-temporal attention loops detected strong structural synthesis signatures along this frame segment.")
+                        st.caption("Spatial-temporal attention loops detected strong structural synthesis signatures along this video timeline.")
                     else:
                         confidence = (1.0 - probability) * 100
                         st.success(f"✅ **VERDICT: AUTHENTIC / LOW SUSPICION ({confidence:.2f}% Confidence)**")
