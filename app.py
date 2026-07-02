@@ -1,7 +1,7 @@
 import streamlit as st
 import os
 import tempfile
-import kagglehub  # NEW: Import kagglehub for downloading the dataset
+import kagglehub
 from model_utils import load_model, predict_video
 
 # ==========================================
@@ -14,19 +14,13 @@ st.set_page_config(
 )
 
 # ==========================================
-# CACHE THE MODEL (Prevents reloading on every click)
+# CACHE THE MODEL
 # ==========================================
 @st.cache_resource
 def get_model_and_device():
-    # Adding a spinner so the user knows a large file is downloading
     with st.spinner("Downloading/Loading ISTVT model weights. This may take a minute on the first run..."):
         try:
-            # This downloads the dataset to a local cache and returns the folder path
-            # It only downloads the file if it hasn't been downloaded already
             dataset_path = kagglehub.dataset_download("gam888i/istvt-pth")
-            
-            # Construct the full path to the .pth file inside the downloaded folder
-            # Note: Ensure the filename here exactly matches the file in your Kaggle dataset!
             weights_path = os.path.join(dataset_path, "istvt_master_weights.pth")
             
             if not os.path.exists(weights_path):
@@ -48,52 +42,64 @@ st.title("👁️ DeepSight: Video Authenticity Engine")
 st.markdown("Powered by the Interpretable Spatial-Temporal Video Transformer (ISTVT)")
 st.divider()
 
-# Upload section
 uploaded_file = st.file_uploader("Upload a video for deepfake analysis", type=["mp4", "avi", "mov"])
 
 if uploaded_file is not None:
-    # We must save the uploaded file temporarily so OpenCV can read it from a file path
-    tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-    tfile.write(uploaded_file.read())
-    video_path = tfile.name
-
     col1, col2 = st.columns([1, 1])
     
     with col1:
         st.subheader("Source Video")
-        st.video(video_path)
+        st.video(uploaded_file)
 
     with col2:
         st.subheader("Analysis & Verdict")
         analyze_button = st.button("Run ISTVT Analysis", type="primary", use_container_width=True)
         
         if analyze_button:
-            with st.spinner("Extracting frames and running attention mechanisms..."):
+            with st.spinner("Extracting frames and running Spatial-Temporal attention mechanisms..."):
+                video_path = None
                 try:
-                    # Run the inference math from model_utils.py
-                    probability = predict_video(model, device, video_path)
+                    # Create and safely close temp file so OpenCV can read it cleanly
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tfile:
+                        tfile.write(uploaded_file.read())
+                        video_path = tfile.name
+                    
+                    # Run the inference and extract XAI heatmaps
+                    probability, spatial_heatmap, temporal_heatmap = predict_video(model, device, video_path)
                     
                     st.divider()
                     
-                    # The Verdict Logic
+                    # 1. The Verdict Logic
                     if probability > 0.5:
                         confidence = probability * 100
                         st.error("🚨 **VERDICT: DEEPFAKE DETECTED**")
                         st.progress(probability)
                         st.markdown(f"**Confidence Score:** {confidence:.2f}% probability of manipulation.")
-                        st.caption("The Spatial-Temporal attention heads detected synthetic blending artifacts in this sequence.")
                     else:
                         confidence = (1.0 - probability) * 100
                         st.success("✅ **VERDICT: AUTHENTIC VIDEO**")
                         st.progress(1.0 - probability)
                         st.markdown(f"**Confidence Score:** {confidence:.2f}% probability of authenticity.")
-                        st.caption("No significant spatial or temporal manipulation artifacts were detected.")
+                    
+                    st.divider()
+
+                    # 2. XAI / LRP Visualizations (Matches Resume Claims)
+                    st.subheader("🔍 Interpretable AI (LRP Analysis)")
+                    st.caption("Visualizing specific manipulation artifacts captured by the spatial and temporal attention heads.")
+                    
+                    col_spat, col_temp = st.columns(2)
+                    with col_spat:
+                        st.image(spatial_heatmap, caption="Spatial Attention (Blending/Forgery Artifacts)", use_container_width=True)
+                    with col_temp:
+                        st.image(temporal_heatmap, caption="Temporal Attention (Inter-frame Inconsistencies)", use_container_width=True)
                         
                 except Exception as e:
                     st.error(f"An error occurred during processing: {e}")
-            
-    # Clean up the temporary file so we don't clog your hard drive
-    try:
-        os.remove(video_path)
-    except:
-        pass
+                
+                finally:
+                    # Clean up file immediately after processing is done
+                    if video_path and os.path.exists(video_path):
+                        try:
+                            os.remove(video_path)
+                        except Exception:
+                            pass
