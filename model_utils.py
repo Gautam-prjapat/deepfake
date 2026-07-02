@@ -50,7 +50,6 @@ class DecomposedAttentionBlock(nn.Module):
         return x
 
 class ISTVT(nn.Module):
-    # CRITICAL: num_frames must be 4 to match your weights
     def __init__(self, num_frames=4, embed_dim=728, num_heads=8, depth=4):
         super().__init__()
         self.backbone = timm.create_model('xception', pretrained=False) 
@@ -131,7 +130,6 @@ def predict_video(model, device, video_path, sequence_length=4):
         if ret:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frames.append(transform(frame_rgb))
-            # Store the original resized for visualization later
             original_viz_frames.append(cv2.resize(frame_rgb, (299, 299)))
         else:
             frames.append(torch.zeros(3, 299, 299))
@@ -140,7 +138,7 @@ def predict_video(model, device, video_path, sequence_length=4):
     cap.release()
     
     video_tensor = torch.stack(frames).unsqueeze(0).to(device)
-    target_idx = sequence_length // 2  # Focus on the middle frame (index 2)
+    target_idx = sequence_length // 2  # Middle frame (index 2)
     target_viz_frame = original_viz_frames[target_idx]
 
     # --- SETUP HOOKS ---
@@ -153,10 +151,12 @@ def predict_video(model, device, video_path, sequence_length=4):
 
     def temporal_hook(module, input, output):
         nonlocal temporal_attention
-        # MultiheadAttention returns (attn_output, attn_output_weights)
-        temporal_attention = output[1].detach().cpu().numpy()
+        # Safety check: Handle cases where weights are None due to fast-path SDPA execution
+        if isinstance(output, tuple) and output[1] is not None:
+            temporal_attention = output[1].detach().cpu().numpy()
+        else:
+            temporal_attention = None
 
-    # Hook into the projection layer (spatial features) and the last temporal attention block
     h1 = model.proj.register_forward_hook(spatial_hook)
     h2 = model.blocks[-1].temporal_attn.register_forward_hook(temporal_hook)
 
@@ -165,24 +165,16 @@ def predict_video(model, device, video_path, sequence_length=4):
         raw_output = model(video_tensor)
         probability = torch.sigmoid(raw_output).item() 
 
-    # Remove hooks
+    # Clean up hooks
     h1.remove()
     h2.remove()
 
     # --- GENERATE HEATMAPS ---
-    
-    # 1. Spatial Heatmap
     if spatial_activations is not None:
-        # Shape is (B*T, embed_dim, 10, 10). T=4, so target is index 2.
-        spatial_map = np.mean(spatial_activations[target_idx], axis=0) # Average across embed_dim
+        spatial_map = np.mean(spatial_activations[target_idx], axis=0)
         spatial_heatmap = generate_overlay_heatmap(spatial_map, target_viz_frame, cv2.COLORMAP_JET)
     else:
-        spatial_heatmap = np.zeros_like(target_viz_frame)
+        spatial_heatmap = target_viz_frame
 
-    # 2. Temporal Heatmap
-    if temporal_attention is not None:
-        # Shape is (B*S, T, T) -> (100, 4, 4)
-        avg_attention = np.mean(temporal_attention, axis=0) # Shape (4, 4)
-        target_attention = avg_attention[target_idx, :] # Shape (4,)
-        
-        # Broadcast the
+    # CRITICAL FIX: Return values explicitly back to app.py
+    return probability, spatial_heatmap
