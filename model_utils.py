@@ -74,7 +74,6 @@ class ISTVT(nn.Module):
         
         features = features.view(B, T, C_new, S).permute(0, 1, 3, 2)
         
-        # Broadcast across the batch dimension (B) seamlessly
         x = features + self.temp_embed + self.pos_embed
         
         for block in self.blocks:
@@ -104,7 +103,7 @@ def generate_overlay_heatmap(relevance_map, original_frame, probability, colorma
     return overlay
 
 # ==========================================
-# 3. AUTONOMOUS MINI-BATCH PIPELINE
+# 3. SERVER-SAFE STREAMING PIPELINE
 # ==========================================
 def load_model(weight_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -123,12 +122,9 @@ def predict_video(model, device, video_path, max_frames=520):
     ])
     
     cap = cv2.VideoCapture(video_path)
-    all_frames = []
-    all_viz_frames = []
-    
     total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Auto-scaling logic
+    # Auto-scaling logic (Caps at 520, drops to actual length if short)
     if total_video_frames < max_frames:
         total_frames_to_sample = total_video_frames
     else:
@@ -137,64 +133,73 @@ def predict_video(model, device, video_path, max_frames=520):
     total_frames_to_sample = max(4, (total_frames_to_sample // 4) * 4)
     step = max(1, total_video_frames // total_frames_to_sample)
     
-    for i in range(total_frames_to_sample):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
-        ret, frame = cap.read()
-        if ret:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            all_frames.append(transform(frame_rgb))
-            all_viz_frames.append(cv2.resize(frame_rgb, (299, 299)))
-        else:
-            all_frames.append(torch.zeros(3, 299, 299))
-            all_viz_frames.append(np.zeros((299, 299, 3), dtype=np.uint8))
+    max_probability = 0.0
+    best_spatial_heatmap = None
+    
+    # Process the video in streaming chunks of 16 frames to prevent RAM overflow on servers
+    CHUNK_SIZE = 16 
+    
+    for chunk_start in range(0, total_frames_to_sample, CHUNK_SIZE):
+        chunk_frames = []
+        chunk_viz_frames = []
+        
+        # EXTRACT ONLY THIS CHUNK
+        for i in range(chunk_start, min(chunk_start + CHUNK_SIZE, total_frames_to_sample)):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
+            ret, frame = cap.read()
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                chunk_frames.append(transform(frame_rgb))
+                chunk_viz_frames.append(cv2.resize(frame_rgb, (299, 299)))
+            else:
+                chunk_frames.append(torch.zeros(3, 299, 299))
+                chunk_viz_frames.append(np.zeros((299, 299, 3), dtype=np.uint8))
+                
+        # PACK WINDOWS
+        num_windows_in_chunk = len(chunk_frames) // 4
+        if num_windows_in_chunk == 0:
+            continue
             
-    cap.release()
+        window_tensors = []
+        for w in range(num_windows_in_chunk):
+            idx = w * 4
+            window_tensors.append(torch.stack(chunk_frames[idx:idx+4]))
+            
+        batch_chunk = torch.stack(window_tensors).to(device)
 
-    # Pack frames into 4-frame windows
-    num_windows = total_frames_to_sample // 4
-    window_tensors = []
-    
-    for w in range(num_windows):
-        idx = w * 4
-        window_tensors.append(torch.stack(all_frames[idx:idx+4]))
+        # SETUP HOOK FOR THIS CHUNK
+        spatial_activations = None
+        def spatial_hook(module, input, output):
+            nonlocal spatial_activations
+            spatial_activations = output.detach().cpu().numpy()
 
-    spatial_activations_list = []
-    def spatial_hook(module, input, output):
-        spatial_activations_list.append(output.detach().cpu().numpy())
+        h1 = model.proj.register_forward_hook(spatial_hook)
 
-    h1 = model.proj.register_forward_hook(spatial_hook)
-    all_probabilities = []
-
-    # Memory-safe mini-batching (processes 4 windows / 16 frames at a time)
-    CHUNK_SIZE = 4 
-    
-    with torch.no_grad():
-        for i in range(0, num_windows, CHUNK_SIZE):
-            batch_chunk = torch.stack(window_tensors[i:i+CHUNK_SIZE]).to(device)
+        # FORWARD PASS
+        with torch.no_grad():
             raw_outputs = model(batch_chunk)
             chunk_probs = torch.sigmoid(raw_outputs).cpu().numpy().flatten()
-            all_probabilities.extend(chunk_probs)
 
-    h1.remove()
+        h1.remove()
 
-    probabilities = np.array(all_probabilities)
-    if len(spatial_activations_list) > 0:
-        spatial_activations = np.concatenate(spatial_activations_list, axis=0)
-    else:
-        spatial_activations = None
+        # CHECK FOR NEW PEAK ANOMALY
+        local_max_idx = int(np.argmax(chunk_probs))
+        local_max_prob = float(chunk_probs[local_max_idx])
+        
+        if local_max_prob > max_probability or best_spatial_heatmap is None:
+            max_probability = local_max_prob
+            
+            peak_viz_window = chunk_viz_frames[local_max_idx * 4 : (local_max_idx * 4) + 4]
+            target_viz_frame = peak_viz_window[2]
+            
+            if spatial_activations is not None:
+                global_frame_index_in_batch = (local_max_idx * 4) + 2
+                spatial_map = np.mean(spatial_activations[global_frame_index_in_batch], axis=0)
+                best_spatial_heatmap = generate_overlay_heatmap(spatial_map, target_viz_frame, max_probability)
+            else:
+                best_spatial_heatmap = target_viz_frame
+                
+        # Memory is automatically cleared as the arrays reset on the next loop iteration
 
-    # Extract peak anomaly
-    max_idx = int(np.argmax(probabilities))
-    max_probability = float(probabilities[max_idx])
-    
-    peak_viz_window = all_viz_frames[max_idx * 4 : (max_idx * 4) + 4]
-    target_viz_frame = peak_viz_window[2] 
-
-    if spatial_activations is not None:
-        global_frame_index = (max_idx * 4) + 2
-        spatial_map = np.mean(spatial_activations[global_frame_index], axis=0)
-        best_spatial_heatmap = generate_overlay_heatmap(spatial_map, target_viz_frame, max_probability)
-    else:
-        best_spatial_heatmap = target_viz_frame
-
+    cap.release()
     return max_probability, best_spatial_heatmap
