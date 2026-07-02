@@ -54,13 +54,13 @@ if uploaded_file is not None:
         st.subheader("Source Video")
         st.video(video_path)
         
-        # Adjustable scanning deep matrix slider
+        # INCREASED SCANNED FRAME CAPACITY CONFIGURATION
         frames_to_scan = st.slider(
             "Scan Coverage Depth (Total Frames Explored)", 
             min_value=4, 
-            max_value=32, 
-            value=16, 
-            step=4,
+            max_value=256,  # Scaled from 32 to 256 frames
+            value=64,       # Default starting sample coverage set to 64 frames
+            step=4,         # Must remain a multiple of 4 to fit the window blocks
             help="Higher numbers slice the video into deeper checks to catch rapid face swaps."
         )
 
@@ -69,7 +69,7 @@ if uploaded_file is not None:
         analyze_button = st.button("Run Multi-Window ISTVT Analysis", type="primary", use_container_width=True)
         
         if analyze_button:
-            with st.spinner(f"Running sliding-window inference across {frames_to_scan} frames..."):
+            with st.spinner(f"Running parallel sliding-window inference across {frames_to_scan} frames..."):
                 try:
                     # Execute sliding window array inference pipeline
                     probability, spatial_heatmap = predict_video(model, device, video_path, total_frames_to_sample=frames_to_scan)
