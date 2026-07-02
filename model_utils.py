@@ -6,7 +6,7 @@ import numpy as np
 from torchvision import transforms
 
 # ==========================================
-# 1. ARCHITECTURE DEFINITIONS 
+# 1. ARCHITECTURE DEFINITIONS
 # ==========================================
 class SelfSubtract(nn.Module):
     def __init__(self):
@@ -87,7 +87,11 @@ class ISTVT(nn.Module):
 # ==========================================
 # 2. VISUALIZATION UTILS
 # ==========================================
-def generate_overlay_heatmap(relevance_map, original_frame, colormap=cv2.COLORMAP_JET):
+def generate_overlay_heatmap(relevance_map, original_frame, probability, colormap=cv2.COLORMAP_JET):
+    # Silence the heatmap for authentic videos to prevent false red highlights
+    if probability < 0.5:
+        return original_frame
+
     relevance_map = relevance_map - np.min(relevance_map)
     relevance_map = relevance_map / (np.max(relevance_map) + 1e-8)
     relevance_map = np.uint8(255 * relevance_map)
@@ -100,7 +104,7 @@ def generate_overlay_heatmap(relevance_map, original_frame, colormap=cv2.COLORMA
     return overlay
 
 # ==========================================
-# 3. MEMORY-SAFE MINI-BATCH PIPELINE
+# 3. AUTONOMOUS MINI-BATCH PIPELINE
 # ==========================================
 def load_model(weight_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -110,7 +114,7 @@ def load_model(weight_path):
     model.eval() 
     return model, device
 
-def predict_video(model, device, video_path, total_frames_to_sample=64):
+def predict_video(model, device, video_path, max_frames=520):
     transform = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((299, 299)), 
@@ -124,6 +128,12 @@ def predict_video(model, device, video_path, total_frames_to_sample=64):
     
     total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
+    # Auto-scaling logic
+    if total_video_frames < max_frames:
+        total_frames_to_sample = total_video_frames
+    else:
+        total_frames_to_sample = max_frames
+        
     total_frames_to_sample = max(4, (total_frames_to_sample // 4) * 4)
     step = max(1, total_video_frames // total_frames_to_sample)
     
@@ -140,7 +150,7 @@ def predict_video(model, device, video_path, total_frames_to_sample=64):
             
     cap.release()
 
-    # --- VECTORIZED BATCH PACKING ---
+    # Pack frames into 4-frame windows
     num_windows = total_frames_to_sample // 4
     window_tensors = []
     
@@ -148,7 +158,6 @@ def predict_video(model, device, video_path, total_frames_to_sample=64):
         idx = w * 4
         window_tensors.append(torch.stack(all_frames[idx:idx+4]))
 
-    # Setup list to accumulate hook data chunk by chunk
     spatial_activations_list = []
     def spatial_hook(module, input, output):
         spatial_activations_list.append(output.detach().cpu().numpy())
@@ -156,9 +165,7 @@ def predict_video(model, device, video_path, total_frames_to_sample=64):
     h1 = model.proj.register_forward_hook(spatial_hook)
     all_probabilities = []
 
-    # --- MEMORY-SAFE MINI-BATCHING ---
-    # We process 4 windows (16 frames) at a time. This keeps VRAM footprint flat 
-    # and prevents OS memory kills while still being much faster than sequential loops.
+    # Memory-safe mini-batching (processes 4 windows / 16 frames at a time)
     CHUNK_SIZE = 4 
     
     with torch.no_grad():
@@ -170,14 +177,13 @@ def predict_video(model, device, video_path, total_frames_to_sample=64):
 
     h1.remove()
 
-    # Consolidate results from the chunks
     probabilities = np.array(all_probabilities)
     if len(spatial_activations_list) > 0:
         spatial_activations = np.concatenate(spatial_activations_list, axis=0)
     else:
         spatial_activations = None
 
-    # --- EXTRACT PEAK FRACTION ANOMALIES ---
+    # Extract peak anomaly
     max_idx = int(np.argmax(probabilities))
     max_probability = float(probabilities[max_idx])
     
@@ -185,10 +191,9 @@ def predict_video(model, device, video_path, total_frames_to_sample=64):
     target_viz_frame = peak_viz_window[2] 
 
     if spatial_activations is not None:
-        # Map the 2D window index space to the flattened 1D frame index space
         global_frame_index = (max_idx * 4) + 2
         spatial_map = np.mean(spatial_activations[global_frame_index], axis=0)
-        best_spatial_heatmap = generate_overlay_heatmap(spatial_map, target_viz_frame)
+        best_spatial_heatmap = generate_overlay_heatmap(spatial_map, target_viz_frame, max_probability)
     else:
         best_spatial_heatmap = target_viz_frame
 
