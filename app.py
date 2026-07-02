@@ -14,7 +14,7 @@ st.set_page_config(
 )
 
 # ==========================================
-# CACHE THE MODEL (Prevents reloading on every click)
+# CACHE THE MODEL
 # ==========================================
 @st.cache_resource
 def get_model_and_device():
@@ -53,34 +53,50 @@ if uploaded_file is not None:
     with col1:
         st.subheader("Source Video")
         st.video(video_path)
+        
+        # Adjustable scanning deep matrix slider
+        frames_to_scan = st.slider(
+            "Scan Coverage Depth (Total Frames Explored)", 
+            min_value=4, 
+            max_value=32, 
+            value=16, 
+            step=4,
+            help="Higher numbers slice the video into deeper checks to catch rapid face swaps."
+        )
 
     with col2:
         st.subheader("Analysis & Verdict")
-        analyze_button = st.button("Run ISTVT Analysis", type="primary", use_container_width=True)
+        analyze_button = st.button("Run Multi-Window ISTVT Analysis", type="primary", use_container_width=True)
         
         if analyze_button:
-            with st.spinner("Extracting frames and running attention mechanisms..."):
+            with st.spinner(f"Running sliding-window inference across {frames_to_scan} frames..."):
                 try:
-                    # CRITICAL FIX: Unpack both variables returned by the function
-                    probability, spatial_heatmap = predict_video(model, device, video_path)
+                    # Execute sliding window array inference pipeline
+                    probability, spatial_heatmap = predict_video(model, device, video_path, total_frames_to_sample=frames_to_scan)
                     
                     st.divider()
                     
-                    # The Verdict Logic
+                    # Core Performance Metrics Display
+                    st.metric(label="Peak Manipulation Probability Detect Score", value=f"{probability:.4f}")
+                    
                     if probability > 0.5:
                         confidence = probability * 100
-                        st.error("🚨 **VERDICT: DEEPFAKE DETECTED**")
+                        st.error(f"🚨 **VERDICT: DEEPFAKE DETECTED ({confidence:.2f}% Confidence)**")
                         st.progress(probability)
-                        st.markdown(f"**Confidence Score:** {confidence:.2f}% probability of manipulation.")
+                        st.caption("Spatial-temporal attention loops detected strong structural synthesis signatures along this frame segment.")
                     else:
                         confidence = (1.0 - probability) * 100
-                        st.success("✅ **VERDICT: AUTHENTIC VIDEO**")
+                        st.success(f"✅ **VERDICT: AUTHENTIC / LOW SUSPICION ({confidence:.2f}% Confidence)**")
                         st.progress(1.0 - probability)
-                        st.markdown(f"**Confidence Score:** {confidence:.2f}% probability of authenticity.")
+                        st.caption("No sustained synthetic anomalies crossed the structural classification threshold.")
                     
-                    # Display XAI Spatial Heatmap explanation below metrics
-                    st.subheader("Spatial Attention Map (Interpretable Hook)")
-                    st.image(spatial_heatmap, caption="Highlighted regions show where the Transformer detected synthetic textures/artifacts.", use_container_width=True)
+                    # Render Attention Activation Layout Map
+                    st.subheader("Peak Attention Anomalies Layer Visualization")
+                    st.image(
+                        spatial_heatmap, 
+                        caption="Activation landscape highlighting structural areas evaluated during peak suspicion frames.", 
+                        use_container_width=True
+                    )
                         
                 except Exception as e:
                     st.error(f"An error occurred during processing: {e}")
