@@ -1,0 +1,8 @@
+streamlit
+kagglehub
+torch
+torchvision
+opencv-python-headless
+numpy
+Pillow
+timm
