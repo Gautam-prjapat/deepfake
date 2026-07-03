@@ -131,11 +131,12 @@ def predict_video(model, device, video_path, max_frames=520):
     total_frames_to_sample = max(4, (total_frames_to_sample // 4) * 4)
     step = max(1, total_video_frames // total_frames_to_sample)
     
-    # We will store ALL probabilities here. A list of 520 floats uses virtually zero RAM.
     all_probabilities = []
     
     peak_anomaly_score = -1.0
-    best_spatial_heatmap = None
+    saved_spatial_map = None
+    saved_temporal_map = None
+    saved_target_frame = None
     
     CHUNK_SIZE = 16 
     
@@ -165,62 +166,75 @@ def predict_video(model, device, video_path, max_frames=520):
             
         batch_chunk = torch.stack(window_tensors).to(device)
 
+        # --- SETUP BOTH HOOKS ---
         spatial_activations = None
+        temporal_attention = None
+
         def spatial_hook(module, input, output):
             nonlocal spatial_activations
             spatial_activations = output.detach().cpu().numpy()
 
+        def temporal_hook(module, input, output):
+            nonlocal temporal_attention
+            temporal_attention = output[1].detach().cpu().numpy()
+
         h1 = model.proj.register_forward_hook(spatial_hook)
+        h2 = model.blocks[-1].temporal_attn.register_forward_hook(temporal_hook)
 
         with torch.no_grad():
             raw_outputs = model(batch_chunk)
             chunk_probs = torch.sigmoid(raw_outputs).cpu().numpy().flatten()
             
-        # Add these specific window probabilities to our master list
         all_probabilities.extend(chunk_probs)
 
         h1.remove()
+        h2.remove()
 
-        # Track the absolute peak for the heatmap visualization
+        # Track the absolute peak for the heatmap visualizations
         local_max_idx = int(np.argmax(chunk_probs))
         local_max_prob = float(chunk_probs[local_max_idx])
         
-        if local_max_prob > peak_anomaly_score or best_spatial_heatmap is None:
+        if local_max_prob > peak_anomaly_score:
             peak_anomaly_score = local_max_prob
             peak_viz_window = chunk_viz_frames[local_max_idx * 4 : (local_max_idx * 4) + 4]
             target_viz_frame = peak_viz_window[2]
             
+            # Save Spatial Map
             if spatial_activations is not None:
                 global_frame_index_in_batch = (local_max_idx * 4) + 2
                 saved_spatial_map = np.mean(spatial_activations[global_frame_index_in_batch], axis=0)
-                saved_target_frame = target_viz_frame
-            else:
-                saved_spatial_map = None
-                saved_target_frame = target_viz_frame
+            
+            # Save Temporal Map
+            if temporal_attention is not None:
+                avg_attention = np.mean(temporal_attention, axis=0) 
+                target_attention = avg_attention[2, :] 
+                saved_temporal_map = np.tile(target_attention, (target_attention.shape[0], 1))
+                
+            saved_target_frame = target_viz_frame
 
     cap.release()
     
     # ==========================================
     # THE TOP-K% POOLING MATH
     # ==========================================
+    if not all_probabilities:
+        return 0.0, None, None
+
     probs_array = np.array(all_probabilities)
-    
-    # Sort the probabilities from highest to lowest
     sorted_probs = np.sort(probs_array)[::-1]
-    
-    # Calculate how many frames represent the Top 10% (minimum 1 frame)
     k = max(1, int(len(sorted_probs) * 0.10))
-    
-    # Extract only the most suspicious 10% segment
     top_10_percent_probs = sorted_probs[:k]
-    
-    # The final score is the average of that highly suspicious segment
     final_video_probability = float(np.mean(top_10_percent_probs))
     
-    # Generate the heatmap based on this new balanced score
-    if saved_spatial_map is not None:
-        best_spatial_heatmap = generate_overlay_heatmap(saved_spatial_map, saved_target_frame, final_video_probability)
+    # Generate the heatmaps
+    if saved_spatial_map is not None and saved_target_frame is not None:
+        best_spatial_heatmap = generate_overlay_heatmap(saved_spatial_map, saved_target_frame, final_video_probability, cv2.COLORMAP_JET)
     else:
         best_spatial_heatmap = saved_target_frame
 
-    return final_video_probability, best_spatial_heatmap
+    if saved_temporal_map is not None and saved_target_frame is not None:
+        best_temporal_heatmap = generate_overlay_heatmap(saved_temporal_map, saved_target_frame, final_video_probability, cv2.COLORMAP_MAGMA)
+    else:
+        best_temporal_heatmap = saved_target_frame
+
+    return final_video_probability, best_spatial_heatmap, best_temporal_heatmap
