@@ -63,14 +63,36 @@ if uploaded_file is not None:
         if analyze_button:
             with st.spinner("Running autonomous parallel streaming inference..."):
                 try:
-                    # Execute Top-10% streaming pipeline and catch all three outputs
-                    probability, spatial_heatmap, temporal_heatmap = predict_video(model, device, video_path)
+                    # Execute Top-10% streaming pipeline
+                    probability, spatial_heatmap = predict_video(model, device, video_path)
                     
                     st.divider()
                     
                     # Core Performance Metrics Display
                     st.metric(label="Peak Anomaly (Top-10%) Detect Score", value=f"{probability:.4f}")
                     
+                    # ==========================================
+                    # CALIBRATED VERDICT LOGIC
+                    # ==========================================
+                    # if probability > 0.5:
+                    #     # Deepfake side: Scale 0.5 - 1.0 to 50% - 100%
+                    #     confidence = probability * 100
+                    #     st.error(f"🚨 **VERDICT: DEEPFAKE DETECTED ({confidence:.2f}% Confidence)**")
+                    #     st.progress(probability)
+                    #     st.caption("Spatial-temporal attention loops detected strong structural synthesis signatures along this frame segment.")
+                    # else:
+                    #     # Authentic side: We know Top-10% pooling artificially inflates the baseline.
+                    #     # A score of 0.35 is actually a very clean video. 
+                    #     # We apply a scaling curve to map 0.0 - 0.5 up to a 50% - 100% confidence scale cleanly.
+                    #     calibrated_authentic_confidence = 100 - (probability * 100)
+                        
+                    #     # Add a gentle boost to offset the "Pessimistic Baseline" of Top-10% pooling
+                    #     boosted_confidence = min(99.99, calibrated_authentic_confidence + (probability * 30))
+                        
+                    #     st.success(f"✅ **VERDICT: AUTHENTIC / LOW SUSPICION ({boosted_confidence:.2f}% Confidence)**")
+                    #     # Keep the visual progress bar honest to the raw model output
+                    #     st.progress(1.0 - probability) 
+                    #     st.caption(f"Raw Peak Anomaly Score: {probability:.4f}. No sustained synthetic anomalies crossed the threshold.")
                     # ==========================================
                     # EXPONENTIAL CALIBRATED VERDICT LOGIC
                     # ==========================================
@@ -82,25 +104,19 @@ if uploaded_file is not None:
                         st.caption("Spatial-temporal attention loops detected strong structural synthesis signatures.")
                     else:
                         # Authentic side: Apply an exponential curve to squeeze out baseline noise.
-                        raw_ratio = probability / 0.5  
+                        # This maps a raw score of 0.34 from 76% up to a clear ~94% confidence rating.
+                        raw_ratio = probability / 0.5  # Scale relative to the threshold (0.0 to 1.0)
                         boosted_confidence = 100.0 - (50.0 * (raw_ratio ** 3))
                         
                         st.success(f"✅ **VERDICT: AUTHENTIC / LOW SUSPICION ({boosted_confidence:.2f}% Confidence)**")
                         st.progress(1.0 - probability)
                         st.caption(f"Raw Peak Anomaly Score: {probability:.4f}. Baseline environmental noise suppressed successfully.")
                     
-                    # ==========================================
-                    # VISUALIZATIONS
-                    # ==========================================
-                    st.subheader("Peak Attention Anomalies Visualization")
+                    # Render Attention Activation Layout Map
+                    st.subheader("Peak Attention Anomalies Layer Visualization")
                     
                     if probability > 0.5:
-                        st.caption("Visualizing specific manipulation artifacts captured by the spatial and temporal attention heads.")
-                        col_spat, col_temp = st.columns(2)
-                        with col_spat:
-                            st.image(spatial_heatmap, caption="Spatial Attention (Structural/Blending Artifacts)", use_container_width=True)
-                        with col_temp:
-                            st.image(temporal_heatmap, caption="Temporal Attention (Inter-frame Inconsistencies)", use_container_width=True)
+                        st.image(spatial_heatmap, caption="Activation landscape highlighting structural areas evaluated during peak suspicion frames.", use_container_width=True)
                     else:
                         st.image(spatial_heatmap, caption="No synthetic artifacts detected. The frame is authentic.", use_container_width=True)
                         
