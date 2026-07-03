@@ -5,4 +5,4 @@ https://www.kaggle.com/datasets/gam888i/istvt-pth
 
 
 Link of the streamlit app:
-https://deepfakeconfirmer.streamlit.app/
+https://deepfake-huycynwhmndahtyxc4dczd.streamlit.app/
