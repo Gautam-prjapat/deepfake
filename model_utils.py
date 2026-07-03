@@ -87,7 +87,6 @@ class ISTVT(nn.Module):
 # 2. VISUALIZATION UTILS
 # ==========================================
 def generate_overlay_heatmap(relevance_map, original_frame, global_probability, colormap=cv2.COLORMAP_JET):
-    # If the overall video is classified as authentic, suppress the heatmap overlay entirely
     if global_probability < 0.5:
         return original_frame
 
@@ -103,7 +102,7 @@ def generate_overlay_heatmap(relevance_map, original_frame, global_probability, 
     return overlay
 
 # ==========================================
-# 3. ROBUST STREAMING ENGINE
+# 3. TOP-K% POOLING STREAMING ENGINE
 # ==========================================
 def load_model(weight_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -132,9 +131,8 @@ def predict_video(model, device, video_path, max_frames=520):
     total_frames_to_sample = max(4, (total_frames_to_sample // 4) * 4)
     step = max(1, total_video_frames // total_frames_to_sample)
     
-    # Running variables to compute global average and locate peak anomaly
-    running_prob_sum = 0.0
-    total_windows_processed = 0
+    # We will store ALL probabilities here. A list of 520 floats uses virtually zero RAM.
+    all_probabilities = []
     
     peak_anomaly_score = -1.0
     best_spatial_heatmap = None
@@ -177,14 +175,13 @@ def predict_video(model, device, video_path, max_frames=520):
         with torch.no_grad():
             raw_outputs = model(batch_chunk)
             chunk_probs = torch.sigmoid(raw_outputs).cpu().numpy().flatten()
+            
+        # Add these specific window probabilities to our master list
+        all_probabilities.extend(chunk_probs)
 
         h1.remove()
 
-        # Update global accumulation counters
-        running_prob_sum += float(np.sum(chunk_probs))
-        total_windows_processed += len(chunk_probs)
-
-        # Track the peak anomaly within this window to map structural anomalies
+        # Track the absolute peak for the heatmap visualization
         local_max_idx = int(np.argmax(chunk_probs))
         local_max_prob = float(chunk_probs[local_max_idx])
         
@@ -193,7 +190,6 @@ def predict_video(model, device, video_path, max_frames=520):
             peak_viz_window = chunk_viz_frames[local_max_idx * 4 : (local_max_idx * 4) + 4]
             target_viz_frame = peak_viz_window[2]
             
-            # Temporarily store the raw spatial activation map for the peak frame
             if spatial_activations is not None:
                 global_frame_index_in_batch = (local_max_idx * 4) + 2
                 saved_spatial_map = np.mean(spatial_activations[global_frame_index_in_batch], axis=0)
@@ -204,10 +200,24 @@ def predict_video(model, device, video_path, max_frames=520):
 
     cap.release()
     
-    # Compute robust global mean probability across the video timeline
-    final_video_probability = running_prob_sum / max(1, total_windows_processed)
+    # ==========================================
+    # THE TOP-K% POOLING MATH
+    # ==========================================
+    probs_array = np.array(all_probabilities)
     
-    # Process the final heatmap using the global video status context
+    # Sort the probabilities from highest to lowest
+    sorted_probs = np.sort(probs_array)[::-1]
+    
+    # Calculate how many frames represent the Top 10% (minimum 1 frame)
+    k = max(1, int(len(sorted_probs) * 0.10))
+    
+    # Extract only the most suspicious 10% segment
+    top_10_percent_probs = sorted_probs[:k]
+    
+    # The final score is the average of that highly suspicious segment
+    final_video_probability = float(np.mean(top_10_percent_probs))
+    
+    # Generate the heatmap based on this new balanced score
     if saved_spatial_map is not None:
         best_spatial_heatmap = generate_overlay_heatmap(saved_spatial_map, saved_target_frame, final_video_probability)
     else:
